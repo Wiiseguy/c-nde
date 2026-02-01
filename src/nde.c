@@ -1,12 +1,20 @@
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <wchar.h>
 #ifdef _WIN32
 #include <windows.h>
 #endif
 
-#include <locale.h>
+#define dynamic_add(type, array, item)                                                       \
+    do                                                                                       \
+    {                                                                                        \
+        if ((array).size >= (array).capacity)                                                \
+        {                                                                                    \
+            (array).capacity = ((array).capacity == 0) ? 1 : (array).capacity * 2;           \
+            (array).items = (type *)realloc((array).items, (array).capacity * sizeof(type)); \
+        }                                                                                    \
+        (array).items[(array).size++] = (item);                                              \
+    } while (0)
 
 enum FIELD_TYPES
 {
@@ -46,8 +54,8 @@ typedef struct
 
 typedef struct
 {
-    NDEDataRecordField *fields;
-    size_t numFields;
+    NDEDataRecordField *items;
+    size_t size;
     size_t capacity;
 } NDEDataRecordFields;
 
@@ -63,8 +71,8 @@ typedef struct
 
 typedef struct
 {
-    NDEDataRecord *records;
-    size_t numRecords;
+    NDEDataRecord *items;
+    size_t size;
     size_t capacity;
 } NDEDataRecords;
 
@@ -102,26 +110,6 @@ uint32_t readUInt32(FILE *file)
     return value;
 }
 
-void addRecord(NDEDataRecords *dataRecords, NDEDataRecord record)
-{
-    if (dataRecords->numRecords >= dataRecords->capacity)
-    {
-        dataRecords->capacity = (dataRecords->capacity == 0) ? 1 : dataRecords->capacity * 2;
-        dataRecords->records = (NDEDataRecord *)realloc(dataRecords->records, dataRecords->capacity * sizeof(NDEDataRecord));
-    }
-    dataRecords->records[dataRecords->numRecords++] = record;
-}
-
-void addField(NDEDataRecordFields *fields, NDEDataRecordField field)
-{
-    if (fields->numFields >= fields->capacity)
-    {
-        fields->capacity = (fields->capacity == 0) ? 1 : fields->capacity * 2;
-        fields->fields = (NDEDataRecordField *)realloc(fields->fields, fields->capacity * sizeof(NDEDataRecordField));
-    }
-    fields->fields[fields->numFields++] = field;
-}
-
 uint32_t nextIndex(FILE *indexFile)
 {
     uint32_t value = readUInt32(indexFile);
@@ -129,84 +117,58 @@ uint32_t nextIndex(FILE *indexFile)
     return value;
 }
 
-void readRecord(FILE *file, NDEDataRecord *record)
-{
-    record->id = readUInt8(file);
-    record->type = readUInt8(file);
-    record->size = readUInt32(file);
-    record->next = readUInt32(file);
-    record->prev = readUInt32(file);
-}
-
 void readColumns(FILE *dataFile, FILE *indexFile)
 {
     uint32_t offset = nextIndex(indexFile);
     fseek(dataFile, offset, SEEK_SET);
-    // int tellPos = ftell(dataFile);
-    // printf("Column Record Offset: 0x%X, File Position: 0x%X\n", offset, tellPos);
 
-    NDEDataRecord record;
     int numRecords = 0;
+    uint32_t next = 0;
     do
     {
-        readRecord(dataFile, &record);
-        // printf("Column Record ID: %u, Type: %u, Size: %d, Next: 0x%X, Prev: %u\n",
-        //        record.id, record.type, record.size, record.next, record.prev);
+        uint8_t id = readUInt8(dataFile);
+        readUInt8(dataFile);  // Gobble type
+        readUInt32(dataFile); // Gobble size
+        next = readUInt32(dataFile);
+        readUInt32(dataFile); // Gobble prev pointer (unused)
 
-        uint8_t columnId = readUInt8(dataFile);
-        readUInt8(dataFile); // 'unique'
+        readUInt8(dataFile); // Gobble column id
+        readUInt8(dataFile); // Gobble 'unique'
         uint8_t len = readUInt8(dataFile);
         char *name = (char *)calloc(len + 1, sizeof(char));
         fread(name, sizeof(char), len, dataFile);
-        columns[(int)record.id].columnId = columnId;
-        columns[(int)record.id].name = name;
+        columns[(int)id].name = name;
 
-        fseek(dataFile, record.next, SEEK_SET);
+        fseek(dataFile, next, SEEK_SET);
         numRecords++;
-    } while (record.next != 0);
-
-    // printf("Defined Columns: %d\n", numRecords);
-    for (int i = 0; i < numRecords; i++)
-    {
-        // printf("Column %u: %s\n", columns[i].columnId, columns[i].name);
-    }
+    } while (next != 0);
 }
 
 NDEDataRecord readTableRecord(size_t offset, FILE *dataFile)
 {
     fseek(dataFile, offset, SEEK_SET);
-    // int tellPos = ftell(dataFile);
-    // printf("Data Record Offset: 0x%llX, File Position: 0x%X\n", offset, tellPos);
 
     NDEDataRecord record = {0};
+    uint32_t next = 0;
     do
     {
-        readRecord(dataFile, &record);
-        // printf("- Data Record ID: %u, Type: %u, Size: %d, Next: 0x%X, Prev: %u\n",
-        //        record.id, record.type, record.size, record.next, record.prev);
-        if (record.id == -1)
-        {
-            printf("  Skipping invalid record with ID >= 128\n");
-            exit(1);
-            return record;
-        }
-
         NDEDataRecordField field = {0};
-        field.fieldType = record.type;
-        field.fieldSize = record.size;
-        field.columnId = record.id;
+        field.columnId = readUInt8(dataFile);
+        field.fieldType = readUInt8(dataFile);
+        field.fieldSize = readUInt32(dataFile);
+        next = readUInt32(dataFile);
+        readUInt32(dataFile); // Gobble prev pointer (unused)
 
-        switch (record.type)
+        switch (field.fieldType)
         {
             // COLUMN (maybe TODO later merge readColumns?)
-        // FILENAME
         case FIELD_TYPE_INDEX:
         {
             break;
         }
         case FIELD_TYPE_REDIRECTOR:
         {
-            record.next = readUInt32(dataFile);
+            next = readUInt32(dataFile);
             break;
         }
         case FIELD_TYPE_STRING:
@@ -274,10 +236,10 @@ NDEDataRecord readTableRecord(size_t offset, FILE *dataFile)
         }
         }
 
-        addField(&record.fields, field);
+        dynamic_add(NDEDataRecordField, record.fields, field);
 
-        fseek(dataFile, record.next, SEEK_SET);
-    } while (record.next != 0);
+        fseek(dataFile, next, SEEK_SET);
+    } while (next != 0);
     return record;
 }
 
@@ -321,13 +283,13 @@ void writeJson(NDEDataRecords *dataRecords, const char *filename)
         return;
     }
     fprintf(jsonFile, "[\n");
-    for (size_t i = 0; i < dataRecords->numRecords; ++i)
+    for (size_t i = 0; i < dataRecords->size; ++i)
     {
         fprintf(jsonFile, "  {\n");
-        NDEDataRecord *record = &dataRecords->records[i];
-        for (size_t j = 0; j < record->fields.numFields; ++j)
+        NDEDataRecord *record = &dataRecords->items[i];
+        for (size_t j = 0; j < record->fields.size; ++j)
         {
-            NDEDataRecordField *field = &record->fields.fields[j];
+            NDEDataRecordField *field = &record->fields.items[j];
             if (field->fieldType == FIELD_TYPE_REDIRECTOR || field->columnId < 0)
             {
                 continue; // Skip redirector fields in JSON output
@@ -373,24 +335,24 @@ void writeJson(NDEDataRecords *dataRecords, const char *filename)
                 fprintf(jsonFile, "%f", field->floatValue);
                 break;
             case FIELD_TYPE_DATETIME:
-                fprintf(jsonFile, "%u", field->uint32Value);
+                fprintf(jsonFile, "%u000", field->uint32Value);
                 break;
             case FIELD_TYPE_LONG:
                 float jsonLong = (float)field->uint64Value;
                 fprintf(jsonFile, "%.0f", jsonLong);
                 break;
             default:
-                fprintf(jsonFile, "\"(unsupported type)\"");
+                fprintf(jsonFile, "\"UNKNOWN_TYPE: %d - size: %u\"", field->fieldType, field->fieldSize);
                 break;
             }
-            if (j < record->fields.numFields - 1)
+            if (j < record->fields.size - 1)
             {
                 fprintf(jsonFile, ",");
             }
             fprintf(jsonFile, "\n");
         }
         fprintf(jsonFile, "  }");
-        if (i < dataRecords->numRecords - 1)
+        if (i < dataRecords->size - 1)
         {
             fprintf(jsonFile, ",");
         }
@@ -403,9 +365,6 @@ void writeJson(NDEDataRecords *dataRecords, const char *filename)
 
 int main(int argc, char *argv[])
 {
-    // setlocale(LC_ALL, "C.UTF-8");
-    setlocale(LC_ALL, "en_US.UTF-8");
-    SetConsoleOutputCP(CP_UTF8);
 
     FILE *indexFile;
     FILE *dataFile;
@@ -438,33 +397,11 @@ int main(int argc, char *argv[])
     columns = (NDEColumn *)malloc(64 * sizeof(NDEColumn)); // Assume max 64 columns
 
     fseek(indexFile, 8, SEEK_SET); // Skip first 8 bytes (header)
-    // uint32_t numRecords = readUInt32(indexFile);
-
-    // Print the read data
-    // printf("Number of Records: %u\n", numRecords);
 
     uint32_t startOfRecords = 16;
     fseek(indexFile, startOfRecords, SEEK_SET);
 
-    // Read the index file
-    // for (uint32_t i = 0; i < numRecords; i++)
-    // {
-    //     uint32_t index = nextIndex(indexFile);
-    //     printf("Index %d: %u\n", i + 1, index);
-    // }
-    fseek(indexFile, startOfRecords, SEEK_SET);
-
     readColumns(dataFile, indexFile);
-
-    // NDEDataRecord columnRecord = readTableRecord(nextIndex(indexFile), dataFile);
-    // addRecord(&dataRecords, columnRecord);
-    // writeJson(&dataRecords, defaultOutput);
-    // fclose(dataFile);
-    // fclose(indexFile);
-    // return 0;
-
-    // readColumns(dataFile, indexFile);
-    //  readIndexRecord(dataFile, indexFile); // Unused, discarded for now
 
     // Gobble the index record
     readTableRecord(nextIndex(indexFile), dataFile);
@@ -474,68 +411,10 @@ int main(int argc, char *argv[])
     while ((offset = nextIndex(indexFile)) != 0)
     {
         NDEDataRecord record = readTableRecord(offset, dataFile);
-        addRecord(&dataRecords, record);
+        dynamic_add(NDEDataRecord, dataRecords, record);
     }
 
-    // for (size_t i = 0; i < dataRecords.numRecords; i++)
-    // {
-    //     printf("Processed Record %zu: ID %u, Fields %zu\n",
-    //            i + 1,
-    //            dataRecords.records[i].id,
-    //            dataRecords.records[i].fields.numFields);
-    //     for (size_t j = 0; j < dataRecords.records[i].fields.numFields; j++)
-    //     {
-    //         NDEDataRecordField *field = &dataRecords.records[i].fields.fields[j];
-    //         if (field->columnId < 0)
-    //         {
-    //             printf("  Field %zu: Invalid Column ID: %u, skipping...\n", j + 1, field->columnId);
-    //             continue; // Skip invalid column IDs
-    //         }
-    //         printf("  Field %zu: Column ID: %u, Column Name: \"%s\", Type %u, Size %u\n",
-    //                j + 1,
-    //                field->columnId,
-    //                columns[(int)field->columnId].name,
-    //                field->fieldType,
-    //                field->fieldSize);
-
-    //         switch (field->fieldType)
-    //         {
-    //         case FIELD_TYPE_STRING:
-    //         case FIELD_TYPE_FILENAME:
-    //             if (field->wstrValue)
-    //             {
-    //                 wprintf(L"    Value: %ls\n", field->wstrValue);
-    //             }
-    //             break;
-    //         case FIELD_TYPE_INTEGER:
-    //         case FIELD_TYPE_LENGTH:
-    //             printf("    Value: %u\n", field->uint32Value);
-    //             break;
-    //         case FIELD_TYPE_BOOLEAN:
-    //             printf("    Value: %u %s\n", field->boolValue, field->boolValue ? "true" : "false");
-    //             break;
-    //         case FIELD_TYPE_BINARY:
-    //             printf("    Value: (Binary Data of size %u)\n", field->fieldSize);
-    //             break;
-    //         case FIELD_TYPE_GUID:
-    //             printf("    Value: (GUID Data)\n");
-    //             break;
-    //         case FIELD_TYPE_FLOAT:
-    //             printf("    Value: %f\n", field->floatValue);
-    //             break;
-    //         case FIELD_TYPE_DATETIME:
-    //             printf("    Value: %u (DateTime)\n", field->uint32Value);
-    //             break;
-    //         case FIELD_TYPE_LONG:
-    //             printf("    Value: %llu\n", field->uint64Value);
-    //             break;
-    //         default:
-    //             printf("    (Value display not implemented for this type)\n");
-    //             break;
-    //         }
-    //     }
-    // }
-    printf("Total Records Processed: %zu\n", dataRecords.numRecords);
+    printf("Total Records Processed: %zu\n", dataRecords.size);
     writeJson(&dataRecords, defaultOutput);
 
     fclose(dataFile);
