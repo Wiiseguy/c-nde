@@ -1,0 +1,1 @@
+gcc -Wall -Wextra src/nde.c -o lib/nde.exe
