@@ -1,1 +1,1 @@
-build & lib\nde ./fixtures/suite.idx ./fixtures/suite.dat
+build & lib\nde .\fixtures\suite.idx .\fixtures\suite.dat

@@ -1,0 +1,1 @@
+gcc -Wall -Wextra src\test.c -o tests\test.exe & tests\test.exe

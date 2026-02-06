@@ -42,7 +42,6 @@ typedef struct
     uint32_t fieldSize;
     union
     {
-        char *strValue;
         wchar_t *wstrValue;
         uint32_t uint32Value;
         uint8_t boolValue;
@@ -57,16 +56,6 @@ typedef struct
     NDEDataRecordField *items;
     size_t size;
     size_t capacity;
-} NDEDataRecordFields;
-
-typedef struct
-{
-    char id;
-    uint8_t type;
-    uint32_t size;
-    uint32_t next;
-    uint32_t prev;
-    NDEDataRecordFields fields;
 } NDEDataRecord;
 
 typedef struct
@@ -78,7 +67,6 @@ typedef struct
 
 typedef struct
 {
-    uint8_t columnId;
     char *name;
 } NDEColumn;
 
@@ -86,10 +74,6 @@ typedef struct
 NDEColumn *columns;
 
 // Functions
-char readChar(FILE *file)
-{
-    return (char)getc(file);
-}
 
 uint8_t readUInt8(FILE *file)
 {
@@ -117,33 +101,6 @@ uint32_t nextIndex(FILE *indexFile)
     return value;
 }
 
-void readColumns(FILE *dataFile, FILE *indexFile)
-{
-    uint32_t offset = nextIndex(indexFile);
-    fseek(dataFile, offset, SEEK_SET);
-
-    int numRecords = 0;
-    uint32_t next = 0;
-    do
-    {
-        uint8_t id = readUInt8(dataFile);
-        readUInt8(dataFile);  // Gobble type
-        readUInt32(dataFile); // Gobble size
-        next = readUInt32(dataFile);
-        readUInt32(dataFile); // Gobble prev pointer (unused)
-
-        readUInt8(dataFile); // Gobble column id
-        readUInt8(dataFile); // Gobble 'unique'
-        uint8_t len = readUInt8(dataFile);
-        char *name = (char *)calloc(len + 1, sizeof(char));
-        fread(name, sizeof(char), len, dataFile);
-        columns[(int)id].name = name;
-
-        fseek(dataFile, next, SEEK_SET);
-        numRecords++;
-    } while (next != 0);
-}
-
 NDEDataRecord readTableRecord(size_t offset, FILE *dataFile)
 {
     fseek(dataFile, offset, SEEK_SET);
@@ -161,7 +118,16 @@ NDEDataRecord readTableRecord(size_t offset, FILE *dataFile)
 
         switch (field.fieldType)
         {
-            // COLUMN (maybe TODO later merge readColumns?)
+        case FIELD_TYPE_COLUMN:
+        {
+            readUInt8(dataFile); // Gobble 'unique'
+            readUInt8(dataFile); // Gobble column id
+            uint8_t len = readUInt8(dataFile);
+            char *name = (char *)calloc(len + 1, sizeof(char));
+            fread(name, sizeof(char), len, dataFile);
+            columns[(int)field.columnId].name = name;
+            break;
+        }
         case FIELD_TYPE_INDEX:
         {
             break;
@@ -175,7 +141,7 @@ NDEDataRecord readTableRecord(size_t offset, FILE *dataFile)
         case FIELD_TYPE_FILENAME:
         {
             uint16_t len = readUInt16(dataFile);
-            char *filename = (char *)calloc(len + 1, sizeof(char));
+            char *filename = (char *)calloc(len + 2, sizeof(char));
             fread(filename, sizeof(char), len, dataFile);
 
             // UTF-16
@@ -231,12 +197,11 @@ NDEDataRecord readTableRecord(size_t offset, FILE *dataFile)
             uint64_t longValue;
             fread(&longValue, sizeof(uint64_t), 1, dataFile);
             field.uint64Value = longValue;
-            // printf("  Long Value: %llu\n", field.uint64Value);
             break;
         }
         }
 
-        dynamic_add(NDEDataRecordField, record.fields, field);
+        dynamic_add(NDEDataRecordField, record, field);
 
         fseek(dataFile, next, SEEK_SET);
     } while (next != 0);
@@ -276,7 +241,7 @@ void fprintUtf8String(FILE *file, const wchar_t *wstr)
 
 void writeJson(NDEDataRecords *dataRecords, const char *filename)
 {
-    FILE *jsonFile = fopen(filename, "w");
+    FILE *jsonFile = fopen(filename, "wb");
     if (!jsonFile)
     {
         perror("Failed to open JSON file for writing");
@@ -287,9 +252,9 @@ void writeJson(NDEDataRecords *dataRecords, const char *filename)
     {
         fprintf(jsonFile, "  {\n");
         NDEDataRecord *record = &dataRecords->items[i];
-        for (size_t j = 0; j < record->fields.size; ++j)
+        for (size_t j = 0; j < record->size; ++j)
         {
-            NDEDataRecordField *field = &record->fields.items[j];
+            NDEDataRecordField *field = &record->items[j];
             if (field->fieldType == FIELD_TYPE_REDIRECTOR || field->columnId < 0)
             {
                 continue; // Skip redirector fields in JSON output
@@ -319,7 +284,6 @@ void writeJson(NDEDataRecords *dataRecords, const char *filename)
             case FIELD_TYPE_BINARY:
             case FIELD_TYPE_GUID:
                 // Print as array of hex bytes
-                printf("Binary/GUID Field Size: %u\n", field->fieldSize);
                 fprintf(jsonFile, "[");
                 for (uint32_t k = 0; k < field->fieldSize; ++k)
                 {
@@ -345,7 +309,7 @@ void writeJson(NDEDataRecords *dataRecords, const char *filename)
                 fprintf(jsonFile, "\"UNKNOWN_TYPE: %d - size: %u\"", field->fieldType, field->fieldSize);
                 break;
             }
-            if (j < record->fields.size - 1)
+            if (j < record->size - 1)
             {
                 fprintf(jsonFile, ",");
             }
@@ -361,39 +325,12 @@ void writeJson(NDEDataRecords *dataRecords, const char *filename)
 
     fprintf(jsonFile, "]\n");
     fclose(jsonFile);
+
+    printf("JSON file '%s' written successfully.\n", filename);
 }
 
-int main(int argc, char *argv[])
+void parse(FILE *indexFile, FILE *dataFile, char *outputFilename)
 {
-
-    FILE *indexFile;
-    FILE *dataFile;
-
-    char *defaultOutput = "output.json";
-
-    if (argc != 3)
-    {
-        fprintf(stderr, "Usage: %s <.idx file> <.dat file>\n", argv[0]);
-        return 1;
-    }
-
-    const char *indexFilename = argv[1];
-    indexFile = fopen(indexFilename, "rb");
-    if (!indexFile)
-    {
-        perror("Failed to open file");
-        return 1;
-    }
-
-    const char *dataFilename = argv[2];
-    dataFile = fopen(dataFilename, "rb");
-    if (!dataFile)
-    {
-        perror("Failed to open file");
-        fclose(indexFile);
-        return 1;
-    }
-
     columns = (NDEColumn *)malloc(64 * sizeof(NDEColumn)); // Assume max 64 columns
 
     fseek(indexFile, 8, SEEK_SET); // Skip first 8 bytes (header)
@@ -401,7 +338,8 @@ int main(int argc, char *argv[])
     uint32_t startOfRecords = 16;
     fseek(indexFile, startOfRecords, SEEK_SET);
 
-    readColumns(dataFile, indexFile);
+    // Read the columns
+    readTableRecord(nextIndex(indexFile), dataFile);
 
     // Gobble the index record
     readTableRecord(nextIndex(indexFile), dataFile);
@@ -415,10 +353,5 @@ int main(int argc, char *argv[])
     }
 
     printf("Total Records Processed: %zu\n", dataRecords.size);
-    writeJson(&dataRecords, defaultOutput);
-
-    fclose(dataFile);
-    fclose(indexFile);
-
-    return 0;
+    writeJson(&dataRecords, outputFilename);
 }
